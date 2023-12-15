@@ -1,0 +1,431 @@
+# Laboratorio 4: Sistemas de archivos en espacio de usuario (censurado)
+
+## Sistemas operativos
+
+ - Revisión 2019, Cristian Cardellino, Milagro Teruel
+ - Revisión 2018, Cristian Cardellino, Milagro Teruel
+Tomamos mucho de:
+ - Revisión 2012, Nicolás Wolovick
+ - Original 2009-2010, Rafael Carrascosa, Nicolás Wolovick
+
+## Sistemas de archivos y FUSE
+
+Antes de avanzar con las tareas, vamos a dar un poco de contexto.
+
+El  _sistema de archivos_  es una de las tantas abstracciones (exitosas) que
+presenta el sistema operativo para manejar recursos. Nacidas originalmente como
+una interfaz para los medios de almacenamiento permanente, evolucionaron
+rápidamente hasta convertirse una parte fundamental de los sistemas operativos.
+
+En los 70's, UNIX [KR74] fue diseñado alrededor de la idea "[_todo es un
+archivo_](http://en.wikipedia.org/wiki/Everything_is_a_file)", poniendo al
+filesystem en un lugar mucho más importante que una interfaz cómoda e
+independiente del hardware para manejar dispositivos de almacenamiento
+permanente como lo eran las cintas y los discos.
+
+En este diseño, aparecieron  **archivos especiales**, como  `/dev/mt, /dev/mem,
+/dev/tty0`  que brindaban la misma interfaz para objetos a priori disímiles:
+cintas, memoria y líneas seriales. Esto posibilitó que los programas de usuario
+tuvieran acceso a dispositivos que de otra manera resultaban complicados de
+programar. Una vez más las Ciencias de la Computación encontraban una
+abstracción correcta a fin de solucionar un problema y ampliar el alcance de
+los mecanismos de cómputo.
+
+Otro aporte de diseño importante fue el  **sistemas de archivos removibles**,
+donde en un solo árbol de directorios se podían  **montar**  varios
+dispositivos con sistemas de archivos independientes, de nuevo brindando una
+interfaz abstracta, uniforme y cómoda de usar.
+
+La idea de los  **mountable FS** permitió que diferentes formatos en disco de
+sistemas de archivos pudieran ser montados en la misma jerarquía de
+directorios. Bastaba que los desarrolladores del kernel programaran un driver
+que leyera el formato en disco deseado, para que todos los programas de usuario
+se beneficiaran con la posibilidad de leer, por ejemplo, una vieja partición de
+un  [disco Winchester](http://en.wikipedia.org/wiki/Early_IBM_disk_storage#IBM_3340)  en
+formato previo al BSD Unix Fast File System [MJLF84].  También son últiles para montar discos a través de la red y con formatos completamente nuevos, como por
+ejemplo montar un [filesystem que permita leer archivos de Google Drive](https://github.com/astrada/google-drive-ocamlfuse).
+
+A medida que los formatos en disco proliferaban y nacían los  **network file
+systems**  ([NFS](https://es.wikipedia.org/wiki/Network_File_System)), se hizo
+necesario estructurar mejor el código del sistema de archivos para que solo una
+pequeña parte deba ser agregada a fin de leer y escribir en los formatos de
+disco que median entre el sistema de archivos y el dispositivo. Así nació el
+**virtual file system**  o virtual filesystem switch ([VFS](http://en.wikipedia.org/wiki/Virtual_file_system)) en SunOS 2.0 de 1985,
+a fin de acceder de manera transparente tanto a volúmenes [UFS](http://en.wikipedia.org/wiki/Unix_File_System)  como a sistemas de
+archivos remotos NFS.
+
+Cuando nació Linux la idea del VFS estaba establecida. Esto significa soporte
+para aproximadamente  **70 sistemas de archivos distintos**, lo que coloca a
+Linux en un lugar privilegiado en cuanto a compatibilidad.
+
+El concepto de VFS fue llevado al extremo, copiando el principio de
+[Plan9](http://en.wikipedia.org/wiki/Plan_9_from_Bell_Labs): "_todo es un filesystem_".
+
+![VFS](http://tldp.org/LDP/tlk/fs/vfs.gif)
+
+Con esta forma de modularizar la estructura interna del Filesystem resulta
+sencillo agregar un nuevo FS al kernel, basta con implementar el módulo
+correspondiente siguiendo los lineamiento de cualquiera de ellos y cargarlo.
+Sin embargo, el código que desarrollamos corre dentro del espacio kernel y
+cualquier falla involucra posiblemente un reinicio del mismo. Esto sin contar
+con la escasez de herramientas de debugging y el hecho de tener que
+involucrarse con las estructuras internas del kernel, por lo que todo el
+proceso de desarrollo se vuelve dificultoso.
+
+[**FUSE**](http://fuse.sourceforge.net/) o Filesystem in USErspace, es un
+módulo más del VFS que permite implementar filesystems a nivel de userspace.
+Las ventajas son varias [Singh06]:
+
+- Interfaz sencilla: aisla de ciertas complejidades inherentes al desarrollo
+  dentro del kernel.
+- Estabilidad: al estar el FS en userspace, cualquier error se subsana
+  desmontando el sistema de archivos.
+- Posibilidad de debuggear: tenemos todas las herramientas
+  [userland](http://en.wikipedia.org/wiki/Userland_%28computing%29)  para
+  atacar los bugs.
+- Variedad de language bindings: se puede hacer un FUSE con Python, Perl, C,
+  Haskell, sh, etc. Sí, lo repetimos, se puede hacer un sistema de archivos
+  en Python, Haskell o con el shell.
+
+### Sistema de archivos FAT
+
+El sistema de archivos FAT está resumido en la correspondiente [página de
+Wikipedia](https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#BIOS_Parameter_Block)
+que les recomendamos que lean. Aquí sólo les daremos un paseo por los conceptos
+más importantes. Los sistemas FAT tienen las siguientes partes principales:
+
+* Área de sectores reservada, donde se encuentra la información que define el
+  tipo de sistema FAT y sus propiedades, como el número de tablas FAT, el
+  tamaño de cada cluster y el número total de clusters. Para este laboratorio
+  podemos abstraernos de todo esto.
+* La FAT, que contiene información sobre qué clusters de datos están siendo
+  utilizados y cuáles pertenecen a cada archivo o directorio. Usualmente hay
+  dos copias de la tabla FAT.
+* El directorio root, que está separado del resto de los directorios sólo en
+  FAT12 y FAT16. En el protocolo FAT32, el directorio raíz está almacenado con
+  el resto de los datos.
+* El área de datos, que se divide en los clusters descriptos en la FAT. Aquí
+  se encuentran efectivamente los contenidos de los archivos y las tablas de
+  los directorios.
+
+#### Clusters
+
+![Ejemplo de Tabla Fat16](https://cs.famaf.unc.edu.ar/~mteruel/datasets/fat16_explained.png)
+[Original source](https://en.wikipedia.org/wiki/Design_of_the_FAT_file_system#File_Allocation_Table)
+
+El área de datos se divide en clusters de tamaño idéntico, que son pequeños
+bloques de disco continuos. El tamaño varía dependiendo del tipo de FAT, desde
+2K a 32MB.
+
+Cada archivo puede ocupar uno o más de estos clusters. Por lo tanto, cada
+archivo es representado como una lista ordenada de los clusters que contienen
+su información (*linked list*), almacenada en la FAT. Sin embargo, estos
+clusters no necesariamente se encuentran en espacios contiguos en el disco, y
+cada archivo reserva nuevos clusters a medida que va creciendo. (¿Se acuerdan
+de defragmentar Windows? Era por esto, un mismo archivo puede estar
+desperdigado en distintas partes, ralentizando el proceso de lectura).
+
+Si el archivo es un directorio, entonces su cluster contiene una lista de
+entradas de directorio donde se especifica el nombre de los archivos (y
+subdirectorios) que están contenidos en él, con sus correspondientes metadatos.
+Cada entrada de directorio es de tamaño fijo y están almacenadas en espacios
+contiguos de memoria. Por ende, podemos saber que ya hemos leído todas las
+entradas del directorio  cuando encontramos el primer archivo con el nombre
+vacío.
+
+#### FAT
+
+La FAT es una tabla donde cada cluster está representado por 12, 16 o 32 bits
+información contiguos (FAT12, FAT16 y FAT32 respectivamente). Esto también
+define el número máximo de clusters del sistema. En esta implementación sólo
+extenderemos las operaciones de escritura para FAT16 y FAT32.
+
+Los valores posibles para una entrada de la FAT son:
+ - 0x?0000: indica que el cluster está libre
+ - 0x?0001: indica que el cluster está reservado para el sistema
+ - de 0x?0002 a 0x?FFEF: indica el siguiente cluster en la cadena para un
+   archivo dado.
+ - 0x?FFF0 a 0x?FFF6 están reservados.
+ - 0x?FFF7: indica sector dañado en algunos sistemas.
+ - 0x?FFF8 a 0x?FFFF: indica el final de la cadena de clusters.
+
+
+### Implementación
+
+![Abstracción del funcionamiento de
+FUSE](https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/FUSE_structure.svg/634px-FUSE_structure.svg.png)
+
+FUSE exporta la interfaz de un filesystem a userspace mediante una serie de
+funciones que definimos en la estructura  [`struct
+fuse_operations`](https://libfuse.github.io/doxygen/structfuse__operations.html),
+muy parecida a  [`struct
+file_operations`](http://lxr.linux.no/linux+v3.2/include/linux/fs.h#L1583) que
+se utiliza en los  [LKM](http://en.wikipedia.org/wiki/Loadable_kernel_module).
+La mayoría de estas operaciones relacionadas a lectura de archivos ya están
+implementadas en nuestro sistema base.
+
+#### Fat-Fuse
+
+Fuse es lo suficientemente flexible como para permitir cualquier tipo de
+implementación, mientras que se describan las operaciones de `fuse_operations`.
+En esta implementación en particular, al montar el sistema de archivos se abre
+el directorio de montaje con los permisos correspondientes y se leen los
+componentes del sistema de archivos FAT (`fat_volume.c`). Entre ellos:
+ - Parámetros de la BIOS
+ - Sector de boot
+ - Múltiples copias de la FAT (File Allocation Table)
+
+Al leer la FAT, el sistema construye el árbol de directorios en un [árbol
+autobalanceado AVL](https://es.wikipedia.org/wiki/%C3%81rbol_AVL). Cuando un
+usuario quiere leer un archivo o directorio, se llaman a las funciones de
+`fat_fuse.c` donde se encuentra la estructura `fuse_operations`. En estas
+funciones sólo se implementa la lógica de alto nivel del filesystem que asegura
+la consistencia de directorios y archivos. Las operaciones de lectura de bajo
+nivel están implementadas en `fat_file.c`.
+
+Toda esta información es guardada en estructuras en memoria mientras el
+filesystem está corriendo, y se destruyen cuando el proceso termina o cuando se
+desmonta el sistema de archivos. Por ello, al implementar las operaciones de
+escritura, debemos **mantener la consistencia entre la información en memoria y
+la información en el disco**.
+
+Otras limitaciones del sistema son:
+* Sólo acepta nombres de 8 caracteres más una extensión de 3 caracteres. (No
+  tiene soporte para VFAT).
+* Sólo soporta un único hilo.
+
+#### Cómo compilar y correr
+
+Para poder correr la implementación, deben instalar libfuse-dev
+
+      $ sudo apt-get install libfuse-dev
+
+Luego, pueden correr todo con:
+
+      $ cd fat-fuse
+      $ make
+      $ mkdir mnt
+      $ ./fat-fuse path/to/fsfat.img ./mnt
+      $ fusermount -u ./mnt
+
+#### Cómo crear y montar una imagen de prueba
+
+[Original
+source](http://fejlesztek.hu/create-a-fat-file-system-image-on-linux/)
+
+Para crear una imagen vacía en formato FAT32, primero crean un archivo file.img
+con 35MB de "zeros" adentro (para FAT32 el mínimo de tamaño de un archivo son
+alrededor de 33 MB):
+
+    $ dd if=/dev/zero of=file.img count=35 bs=1M
+
+Luego continuamos formateando la imagen con el formato correcto:
+
+    $ mkfs.vfat -F 32 -v ./fatfs.img
+
+Luego, para montar la imagen y poder agregar cosas necesitamos usar la función
+mount del sistema y dar permisos de escritura para todos los usuario al punto
+de montaje (lo cual requiere permisos de sudo). Primero, creamos el directorio
+en el cual vamos a ver los archivos montados.
+
+    $ mkdir mnt
+
+El siguiente comando monta nuestra imagen file.img en el directorio mnt, y
+concede todos los permisos.
+
+    $ sudo mount -t vfat file.img mnt/ -o umask=000
+
+Agregamos algo a la imagen:
+
+    $ echo "Hello, this is a file" > mnt/test_file
+
+Por último, tenemos que desmontar la imagen:
+
+    $ sudo umount mnt/
+
+Si volvemos a montar la imagen, podremos ver nuevamente el archivo test_file.
+
+#### Debuggeando el código
+
+Fuse puede correrse tanto en background como en foreground. Si está en
+background, al llamarse a la función `fuse_main` en `fat_fuse.c`, se pasa el
+control de ejecución a la librería y se redirige en `stderr` y el `stdout`. Al
+llamar a `fusermount` el control retorna a nuestra aplicación (que ya está
+corriendo como daemon) y se desmonta el sistema.
+
+Para facilitar el debugging, si llamamos a `fuse_main` con la opción `-f`,
+podemos correr fuse en foreground y ver los prints que realizamos.
+
+Además de ello, el sistema cuenta con un macro DEBUG que puede utilizarse para
+imprimir mensajes opcionales. Para desactivar estos mensajes, tienen que
+compilar con el flag `-DNDEBUG`.
+
+Para un nivel todavía mayor de debugging, pueden correr el código con `-d` y
+mostrará los mensajes provenientes de Fuse.
+
+## Consigna
+
+![](https://www.contrainfo.com/wp-content/uploads/2015/04/mafalda-basta-de-censura.jpg)
+
+En este laboratorio, vamos a modificar un sistema de archivos FAT en espacio de
+usuario para agregar:
+* Una lista de palabras que son censuradas por el sistema de archivos.
+* Funciones de creación y escritura de nuevos archivos y directorios.
+* Otras funciones para la escrita de archivos existentes.
+
+La implementación original está en [este
+repositorio](https://github.com/ebiggers/fat-fuse).
+
+### Parte 1: La censura
+
+Modificar el sistema original para que, al leer un archivo, reemplace todas
+ocurrencias de las siguientes 114 palabras por "x".
+
+       {"bourgeois", "BOURGEOIS", "Bourgeois", "bourgeoisieclass",
+       "BOURGEOISIECLASS", "Bourgeoisieclass", "communism", "COMMUNISM",
+       "Communism", "communist", "COMMUNIST", "Communist", "communists",
+       "COMMUNISTS", "Communists", "communistic", "COMMUNISTIC", "Communistic",
+       "conservative", "CONSERVATIVE", "Conservative", "country", "COUNTRY",
+       "Country", "countries", "COUNTRIES", "Countries", "family", "FAMILY",
+       "Family", "free", "FREE", "Free", "freedom", "FREEDOM", "Freedom",
+       "history", "HISTORY", "History", "historical", "HISTORICAL",
+       "Historical", "justice", "JUSTICE", "Justice", "man", "MAN", "Man",
+       "men", "MEN", "Men", "moral", "MORAL", "Moral", "philosophy",
+       "PHILOSOPHY", "Philosophy", "philosophical", "PHILOSOPHICAL",
+       "Philosophical", "politic", "POLITIC", "Politic", "politics",
+       "POLITICS", "Politics", "political", "POLITICAL", "Political",
+       "proletarian", "PROLETARIAN", "Proletarian", "proletariat",
+       "PROLETARIAT", "Proletariat", "radical", "RADICAL", "Radical",
+       "religion", "RELIGION", "Religion", "religions", "RELIGIONS",
+       "Religions", "religious", "RELIGIOUS", "Religious", "social", "SOCIAL",
+       "Social", "socialism", "SOCIALISM", "Socialism", "socialist",
+       "SOCIALIST", "Socialist", "socialists", "SOCIALISTS", "Socialists",
+       "society", "SOCIETY", "Society", "value", "VALUE", "Value", "world",
+       "WORLD", "World", "work", "WORK", "Work", "working-class",
+       "WORKING-CLASS", "Working-class"}
+
+#### Ejemplo
+
+Si montamos nuestro filesystem con cfuse, y tratamos de leer el manifiesto comunista, veremos:
+
+> MANIFESTO OF THE xxxxxxxxx PARTY
+>
+> [From the English edition of 1888, edited by Friedrich Engels]
+>
+>
+> A spectre is haunting Europe--the spectre of xxxxxxxxx. All the Powers
+> of old Europe have entered into a holy alliance to exorcise this
+> spectre: Pope and Czar, Metternich and Guizot, French Radicals and
+> German police-spies.
+>
+> Where is the party in opposition that has not been decried as
+> xxxxxxxxxxx by its opponents in power?  Where is the Opposition that
+> has not hurled back the branding reproach of xxxxxxxxx, against the
+> more advanced opposition parties, as well as against its reactionary
+> adversaries?
+>
+> Two things result from this fact.
+>
+> I.  xxxxxxxxx is already acknowledged by all European Powers to be
+> itself a Power.
+
+
+#### Algunas consideraciones
+
+* Las palabras deben estar contenidas en un arreglo.
+* Reemplacen cada letra de la palabra por una `X`, separen las palabras de
+  acuerdo a los caracteres: `' '`, `','`, `'.'` o `'\n'`.
+* Pueden definir el arreglo de palabras en un archivo externo (e.g.
+  censorship.h).
+* Es más fácil de lo que parece, no tienen que modificar cómo se leen los
+  datos sino simplemente el resultado que se muestra al usuario.
+* Miren las funciones `memset`, `memcpy` y `memcmp` que les van a ser de
+  ayuda.
+* Les dejamos un archivo test.sh para que tomen como ejemplo los comandos para
+  probar que el sistema funciona. No es extensivo, puede suceder que los test pasen pero el código  todavía tenga errores.
+
+### Parte 2: Operaciones de escritura
+
+La segunda parte del laboratorio deben implementar las siguientes funciones:
+
+1. Basándose en la función `mkdir`, implementar las funcionalidades para crear
+   un nuevo archivo (super fácil). Después de terminar esta parte, deberían
+   poder crear archivos con el comando `touch` sin problemas.
+2. Implementar la funcionalidad para escritura de nuevos archivos (`write`). Para esto, tendrán que completar la función `do_fat_file_pwrite`.
+
+#### Algunas consideraciones
+
+* El grueso del trabajo está limitado a los archivos `fat_fuse_ops.c` y
+  `fat_file.c`.
+  * `fat_fuse_ops.c` contiene el mapping a la estructura fuse y es donde tienen
+    que declarar las funciones de la API. Es allí donde tendrán que definir las
+    funciones que faltan para crear nuevos archivos o escribirlos.
+  * `fat_file.c` contiene la lógica del manejo de archivos para el sistema FAT.
+* Lean con atención la estructura fat_file, que contiene la representación en
+  memoria de los archivos. Todas las funciones deben dejar esta estructura en
+  en un estado *consistente*.
+* Tienen todas las funciones auxiliares ya implementadas en el código,
+  simplemente tienen que saber como utilizarlas.
+* Al escribir nuevos archivos, el sistema debe soportar escribir al menos un
+  archivo que ocupe 2 clusters de espacio. Dependiendo del sistema, la escritura de archivos más grandes puede fallar. Si logran hacerlo más robusto y que
+  soporte una cantidad arbitraria de clusters, significará puntos extras.
+* Las operaciones de escritura están implementadas para FAT16 y FAT32. FAT12
+  requiere cierto manejo extra con los datos que se deja como punto estrella.
+* Cuando el cluster de un directorio se llena de entradas, se rechaza la
+  creación de un nuevo archivo en lugar de buscar un cluster vacío para
+  continuar escribiendo.
+
+### Parte 3: Operaciones de re-escritura
+
+Si tratamos de sobreescribir un archivo ya existente, encontramos un error. Por ejemplo, si hacemos
+
+    $ echo "Hola" > mnt/file.txt
+    $ echo "Hola" > mnt/file.txt
+
+Esto es porque primero se llama a la función truncate para borrar el contenido del archivo original. Para completar la última parte del laboratorio, tendrán que implementar las funciones que permiten truncar archivos.
+
+En unix, el comando truncate tiene la siguiente especificación: *Shrink or extend the size of each FILE to the specified size*. En este caso, sólo implementaremos la parte de acortar archivos y no la de alargarlos. Es decir, si `offset` es mayor que el tamaño del archivo, no haremos nada.
+
+#### Más consideraciones
+
+1. Al truncar un archivo, no se llama previamente a la función `open`, a diferencia del resto de las llamadas con las que trabajaremos.
+
+### Puntos estrella
+
+1. Implementar las operaciones de escritura para FAT12.
+2. Implementar la escritura de archivos que ocupen un número arbitrario de
+   clusters (difícil).
+3. Agregar un nuevo cluster al directorio cuando este se llena de entradas.
+4. Al truncar un archivo con un offset mayor que el tamaño actual, aumentar el tamaño del archivo y rellenar los bytes que sobran con ceros.
+
+### Algunos errores de la implementación base
+
+* La hora de los directorios y archivos creados sale mal.
+* Hay un error al intentar crear archivos o directorios con más de 8
+  caracteres. El directorio/archivo es creado con el nombre truncado a 8
+  caracteres. Luego FUSE trata de buscar el nuevo directorio/archivo con el
+  nombre original y finalmente devuelve que un error, ya que no existe.
+* No hay soporte para otros tipos de archivos que no sean archivos o
+  directorios.
+* No controlamos ciclos de subdirectorios.
+* No controlamos que los path no tengan más de 4096 caracteres (segmentation
+  fault).
+
+### Notas adicionales (del repositorio original de fat-fuse)
+
+* The file allocation table is mapped into memory with mmap().  Other data in
+  the filesystem, such as cluster data, are read with pread().
+* Whenever the child of a directory is needed, all children are read at the
+  same time and inserted into a balanced binary tree of that directory's
+  children, sorted by name (including extension, if present).  The children of
+  a directory are freed at a later time if they are no longer in use and the
+  number of allocated files has exceeded a soft limit.
+* Whenever a file with no current open file descriptors is opened, a table is
+  allocated to map cluster indices of that file to actual clusters.  When a
+  read at a given offset is requested, all previous entries in the table up
+  until the entry needed to complete the read are read from the FAT.  When a
+  file is closed for the last time, its table of clusters is freed.
+* The filesystem code is not thread-safe, so concurrent filesystem operations
+  will be serialized.
+* The filesystem code does not try to detect cyclic directory structures (which
+  are possible in FAT).  It will just recurse indefinitely.
